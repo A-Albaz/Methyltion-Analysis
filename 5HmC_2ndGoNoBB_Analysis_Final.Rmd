@@ -1,0 +1,478 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r load_library, message=FALSE}
+library(readr)
+library(minfi)
+library(dplyr)
+library(shinyMethyl)
+library(ggplot2)
+library(limma)
+library(DMRcate)
+library(reshape2)
+library(GenomicFeatures)
+library(biomaRt)
+library(biovizBase)
+library(ggbio)
+library(cowplot)
+library(rtracklayer)
+library(UpSetR)
+
+# Preprocessing Loading
+# 
+# 2nd Go includes Normal Tussue, Tumour Tissue
+# Excluding Blood and brain impacts results due to high heterogeneity. Treated as a technical outlier
+# Number of Samples: 3,6 respectively
+# 
+load("../Preprocessed_Data/2nd_go_TM_BBRemove_Preprocessed.RData")
+run_name <- "2nd_go_TM_NoBB"
+# 
+
+```
+
+
+```{r load_annovar}
+# annovar.out <- annotation %>% 
+#                dplyr::select(chr, pos, Name) %>% 
+#                mutate(stop = pos, ref = 0, alt = 0) %>% 
+#                dplyr::select(1,2,4,5,6,3)
+# write_tsv(annovar.out, path = "../Annovar/All_Annotation.bed", col_names = F)
+annovar.in <- read_tsv("../Annovar/All_Annotation.bed.variant_function", col_names = F) %>% 
+              as.data.frame %>% 
+              dplyr::select(CpG = X8, Type = X1)
+
+# All Input CpG sites
+annovar.summ <- annovar.in %>% 
+                group_by(Type) %>% 
+                summarise(N_All=n())
+gg.all       <- ggplot(annovar.summ, aes(Type, N_All)) +
+                geom_bar(stat = "identity") + 
+                theme_bw() + ylab("Count") + xlab("") +
+                ggtitle("Summary Counts of CpGs in Analysis by Genomic Type") +
+                theme(axis.text.x = element_text(angle = 90, hjust = 1))
+png(paste0("../Annovar/Output/All_CpGs_In.png"),
+  width  = 10.98,height = 6,
+  units  = "in",res    = 600)
+print(gg.all); dev.off()
+# 
+
+
+annovar.master <- tt_out$Tumour_Tissue %>% 
+                  dplyr::select(CpG) %>% 
+                  left_join(annovar.in) %>% 
+                  group_by(Type) %>% 
+                  summarise(N = n()) %>% 
+                  mutate(Class = "Tumour",
+                         Scale = "Freq") %>% 
+                  ungroup %>% 
+                  left_join(annovar.summ) %>% 
+                  mutate(Frac = (N / N_All)*100) %>% 
+                  dplyr::select(-N_All, -N) %>% 
+                  bind_rows({
+                    tt_out$Normal_Tissue %>% 
+                    dplyr::select(CpG) %>% 
+                    left_join(annovar.in) %>% 
+                    group_by(Type) %>% 
+                    summarise(N = n()) %>% 
+                    mutate(Class = "Normal",
+                           Scale = "Freq") %>% 
+                  ungroup %>% 
+                  left_join(annovar.summ) %>% 
+                  mutate(Frac = (N / N_All)*100) %>% 
+                  dplyr::select(-N_All, -N)
+                  }) %>% 
+                  bind_rows({
+                    annovar.summ %>% 
+                    dplyr::select(Type, Frac = N_All) %>% 
+                    mutate(Class = "All",
+                           Scale = "Count")
+                  }) %>% 
+                  mutate(Lab = ifelse(Scale == "Count", Frac, ""))
+annovar.othr   <- annovar.master %>% filter(as.numeric(Lab) < 100)
+annovar.othr2  <- annovar.master %>% filter(Type %in% annovar.othr$Type)
+annovar.master <- annovar.master %>% filter(!(Type %in% annovar.othr$Type)) %>% 
+                  rbind(.,c("Other", "All", "Count", sum(annovar.othr$Frac), sum(annovar.othr$Frac))) %>% 
+                  rbind(.,c("Other", "Tumour", "Freq", sum({annovar.othr %>% filter(Class == "Tumour") %>% .$Frac}), "")) %>% 
+                  rbind(.,c("Other", "Normal", "Freq", sum({annovar.othr %>% filter(Class == "Normal") %>% .$Frac}), "")) %>% 
+                  mutate(Frac = as.numeric(Frac))
+  
+gg.all       <- ggplot(annovar.master, aes(Type, Frac, fill = Class)) +
+                geom_bar(stat = "identity", position="dodge") + 
+                theme_bw() + ylab("") + xlab("") +
+                facet_grid(Scale ~., scales = "free") +
+                geom_text(aes(label=Lab), vjust=0) +
+                # ggtitle("Summary Counts of CpGs in Analysis by Genomic Type") +
+                theme(axis.text.x = element_text(angle = 60, hjust = 1))
+gg.all
+png(paste0("../Annovar/Output/Everything.png"),
+  width  = 10,height = 6,
+  units  = "in",res    = 600)
+print(gg.all); dev.off()
+
+
+results_and_category_t <- tt_out$Tumour_Tissue %>% 
+                          dplyr::select(1,3) %>% 
+                          left_join(annovar.in)
+write_csv(results_and_category_t, path = "../Annovar/Tumour_Tissue_Categories.csv")
+
+results_and_category_n <- tt_out$Normal_Tissue %>% 
+                          dplyr::select(1,3) %>% 
+                          left_join(annovar.in)
+write_csv(results_and_category_n, path = "../Annovar/Normal_Tissue_Categories.csv")
+
+```
+
+
+```{r custom_boxplots}
+oxbs.mean    <- bVal[,grep("ntissue_OXBS",pheno_in$Tiss_Conv)] %>% 
+                rowMeans %>% 
+                data.frame(CpG = names(.), Beta = .) %>% 
+                mutate(Class = "OXBS")
+boxplot.data <- tt_out$Normal_Tissue %>% 
+                dplyr::select(CpG, Beta = Delta_Beta) %>% 
+                mutate(Class = "OXBS_BS") %>% 
+                bind_rows(oxbs.mean) %>% 
+                left_join(annovar.in) %>% 
+                filter(Beta > 0) %>% 
+                group_by(Type) %>% 
+                mutate(Summ = n()) %>% 
+                filter(Summ > 100)
+gg <- ggplot(boxplot.data, aes(Type, Beta, fill = Class)) +
+      geom_boxplot(outlier.colour = "grey", outlier.size = 0.05) + theme_bw() + 
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      ggtitle("Normal")
+print(gg)
+
+
+oxbs.mean    <- bVal[,grep("ttissue_OXBS",pheno_in$Tiss_Conv)] %>% 
+                rowMeans %>% 
+                data.frame(CpG = names(.), Beta = .) %>% 
+                mutate(Class = "OXBS")
+boxplot.data <- tt_out$Tumour_Tissue %>% 
+                dplyr::select(CpG, Beta = Delta_Beta) %>% 
+                mutate(Class = "OXBS_BS") %>% 
+                bind_rows(oxbs.mean) %>% 
+                left_join(annovar.in) %>% 
+                filter(Beta > 0) %>% 
+                group_by(Type) %>% 
+                mutate(Summ = n()) %>% 
+                filter(Summ > 100)
+gg <- ggplot(boxplot.data, aes(Type, Beta, fill = Class)) +
+      geom_boxplot(outlier.colour = "grey", outlier.size = 0.05) + theme_bw() + 
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      ggtitle("Tumour")
+print(gg)
+
+
+
+primers_tumour <- tt_out$Tumour_Tissue %>% filter(grepl("C[CG]G",Forward_Sequence, fixed = T)) %>% filter(abs(Delta_Beta) > 0.1) %>% arrange(desc(Delta_Beta))
+primers_normal <- tt_out$Normal_Tissue %>% filter(grepl("C[CG]G",Forward_Sequence, fixed = T)) %>% filter(abs(Delta_Beta) > 0.1) %>% arrange(desc(Delta_Beta))
+write_csv(primers_tumour, path = "../Primers_Tumour.csv")
+write_csv(primers_normal, path = "../Primers_Normal.csv")
+
+```
+
+
+
+```{r pca_v1}
+pca                 <- norm_data_f %>% getM %>% t %>% prcomp
+d                   <- pca$x %>% as.data.frame %>% add_rownames("sentrixID") %>% 
+                       left_join((pData(norm_data_f) %>% as.data.frame)) %>% 
+                       mutate_each(funs(factor),Tiss_Conv2) %>% 
+                       as.data.frame
+pcv                 <- round((pca$sdev)^2 / sum(pca$sdev^2)*100, 2)
+
+gg                  <- ggplot(d, aes(PC1,PC2)) +
+                       geom_point(aes(colour = sample, shape=conversion, label=sample), size = 3) + 
+                       theme_bw() +
+                       labs(title = "PCA of Normalised Methylation Data",
+                            subtitle = "") +
+                       theme(axis.title.x    = element_text(size=15),
+                             axis.title.y    = element_text(size=15)) +
+                       xlab(label = paste0("PC (", pcv[1], "%)")) +
+                       ylab(label = paste0("PC (", pcv[2], "%)")) + 
+                       geom_text_repel(aes(label=sample))#+
+                       # geom_text(aes(label = Sample_Name))
+print(gg)
+  
+png(paste0("../Results/5HmC/2nd_go_TM_NoBB/PCA_",run_name,".png"),
+      width  = 10.98,height = 6,
+      units  = "in",res    = 500)
+print(gg); dev.off()
+
+# Scree Plot
+# foo <- data.frame(PC_Variation = pcv, Number = 1:20)
+# ggplot(foo, aes(Number, PC_Variation)) + geom_point() + geom_line() + theme_bw() + ylab("% Variation Explained") + xlab("Principle Component")
+```
+
+```{r unsupervised_clustring_tissue_type}
+Mvals = getM(norm_data_f)
+colnames(Mvals) = pheno_in$sample
+clusters <- hclust(dist(t(Mvals)))
+plot(clusters)
+
+
+png(paste0("../Results/5HmC/2nd_go_TM_NoBB/HierarchicalClustering_",run_name,".png"),
+      width  = 10.98,height = 6,
+      units  = "in",res    = 500)
+plot(clusters, main = paste0("Cluster dendrogram\n", run_name)); dev.off()
+
+# if it's not plotting in the window
+# Run dev.off() in the console first
+# then try again
+
+
+library(ComplexHeatmap)
+
+```
+
+```{r beta_dist}
+pheno_tmp <- pData(norm_data_f) %>% as.data.frame %>% 
+             mutate(Type = ifelse(grepl("normal",grade),"Normal", "Tumour"))
+df        <- norm_data_f %>% 
+             getBeta %>% 
+             melt(value.name = "beta") %>% 
+             left_join(pheno_tmp, by = c("Var2"="sentrixID")) 
+
+gg        <- ggplot(df, aes(beta, colour = sample, linetype = conversion)) +
+             geom_density() + theme_bw() +
+             scale_colour_brewer(palette = "Set1") +
+             facet_grid(. ~ Type) +
+             ggtitle(paste0("Beta Distributions\n",run_name))
+print(gg)
+
+png(paste0("../Results/5HmC/2nd_go_TM_NoBB/BetaDist_",run_name,".png"),
+      width  = 10.98,height = 6,
+      units  = "in",res    = 600)
+print(gg); dev.off()
+```
+
+
+
+
+```{r 5HmC_DM}
+model_type            <- "Paired"
+pheno_in              <- pData(norm_data_f) %>% as.data.frame 
+design                <- model.matrix(~0 + Tiss_Conv2, data = pheno_in)
+block_in              <- pheno_in$sample
+colnames(design)      <- colnames(design) %>% gsub("Tiss_Conv2","",.)
+cont                  <- c("Tumour_Tissue"                  = "hgrade_ttissue_BS-hgrade_ttissue_OXBS",
+                           "Normal_Tissue"                  = "normal_ntissue_BS-normal_ntissue_OXBS")
+                           # "Whole_Blood"                    = "normal_Blood_BS-normal_Blood_OXBS",
+                           # "Brain_Tissue"                   = "normal_Brain_BS-normal_Brain_OXBS")
+cont_mat              <- makeContrasts(contrasts = cont, levels = colnames(design))
+colnames(cont_mat)    <- names(cont)
+cont_vec              <- cont %>% gsub("-","_Vs_",.)
+mVal                  <- getM(norm_data_f)
+bVal                  <- getBeta(norm_data_f)
+fitm                  <- lmFit(getM(norm_data_f),    design, block = block_in, correlation = Corr$cor) %>% 
+                         contrasts.fit(cont_mat) %>% eBayes
+fitb                  <- lmFit(getBeta(norm_data_f), design, block = block_in, correlation = Corr$cor) %>%
+                         contrasts.fit(cont_mat) %>% eBayes
+contrasts             <- colnames(cont_mat)
+pVal                  <- 0.01
+fc                    <- 0.1
+```
+
+
+
+```{r Results, cache=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+tt_out  <- list()
+ttu_out <- list()
+for(i in names(cont_vec)) {
+  ttm                  <- topTable(fitm, coef = i, number = Inf, adjust.method = "BH") %>% 
+                          as.data.frame %>% add_rownames("CpG")
+  ttum                 <- topTable(fitm, coef = i, number = Inf, adjust.method = "BH") %>% 
+                          as.data.frame %>% add_rownames("CpG")
+  if(nrow(ttm) > 0) {
+    ttm                  <- ttm %>% dplyr::select(CpG,P.Value,`adj.P.Val`)
+    ttb                  <- topTable(fitb, coef = i, number = Inf) %>% 
+                            as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,Delta_Beta = logFC)
+    tt                   <- ttm %>% left_join(ttb)  %>% 
+                                    left_join(annotation, by = c("CpG" = "Name")) %>% 
+                                    filter(Delta_Beta > 0)
+    tt$adj.P.Val         <- p.adjust(tt$P.Value, method = "BH")
+    tt                   <- tt %>% filter(adj.P.Val < 0.01, Delta_Beta > 0.1)
+    
+    ttum                 <- ttum %>% dplyr::select(CpG,`adj.P.Val`)
+    ttub                 <- topTable(fitb, coef = i, number = Inf) %>% 
+                            as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,Delta_Beta = logFC)
+    ttu                  <- ttum %>% left_join(ttub)  %>% 
+                                     left_join(annotation, by = c("CpG" = "Name")) %>% 
+                                     mutate(Sig =ifelse(adj.P.Val < 0.01 & abs(Delta_Beta) > 0.1, "Yes","No"))
+    
+    tt %>% print
+    tt_out[[i]]          <- tt
+    ttu_out[[i]]         <- ttu
+    
+    gg <- ggplot(tt, aes(Delta_Beta,-log10(adj.P.Val))) + # , colour = Sig)) +
+          geom_point() + 
+          geom_vline(xintercept = c(0.1,-0.1)) +
+          geom_hline(yintercept = -log10(0.01)) + 
+          theme_bw() +
+          ggtitle(i)
+    print(gg)
+    
+    # Relation_to_Island
+    # UCSC_RefGene_Group
+    # Regulatory_Feature_Group
+    features.spl <- tt$UCSC_RefGene_Group %>% strsplit(.,";") %>% unlist
+    df.features  <- features.spl %>% data.frame(Feature = .) %>% 
+                    group_by(Feature) %>% summarise(count = n()) %>% ungroup %>% 
+                    arrange(desc(count)) %>% mutate(Fraction = (count / length(features.spl))*100)
+    gg.features  <- ggplot(df.features, aes(Feature, Fraction)) +
+                    geom_bar(stat = "identity") + theme_bw() +
+                    ylab("% Fraction of 5hmC") +
+                    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+    print(gg.features)
+    
+    
+    # CpG sites from Differential Methylation
+    # annovar.plot <- tt %>% 
+    #                 dplyr::select(CpG, Delta_Beta) %>% 
+    #                 # mutate(Regulation = ifelse(Delta_Beta > 0, "Hyper", "Hypo")) %>% 
+    #                 left_join(annovar.in, by = c("CpG"="Name")) %>% 
+    #                 group_by(Type) %>% 
+    #                 summarise(N = n()) %>% 
+    #                 ungroup %>% 
+    #                 left_join(annovar.summ) %>% 
+    #                 mutate(Frac = (N / N_All)*100)
+    # annovar.gg   <- ggplot(annovar.plot, aes(Type, Frac)) +
+    #                 geom_bar(stat = "identity") + 
+    #                 theme_bw() + ggtitle(gsub("_"," ",i)) +
+    #                 xlab("") + ylab("% Fraction of total probes") +
+    #                 theme(axis.text.x = element_text(angle = 90, hjust = 1))
+    # png(paste0("../Annovar/Output/Histogram_",i,".png"),
+    #       width  = 10.98,height = 6,
+    #       units  = "in",res    = 600)
+    # print(annovar.gg); dev.off()
+    # 
+    
+
+    write_tsv(tt, path = paste0("../Results/5HmC/2nd_go_TM_NoBB/with negative and p_val 0.01/V2_with_Negative_",model_type,"_",i,"_",run_name,".txt"))
+    
+  } else {
+    paste0(i, ": No DM Results") %>% print
+  }
+}
+```
+
+
+```{r sets}
+T_Only <- setdiff(tt_out$Tumour_Tissue$CpG, tt_out$Normal_Tissue$CpG) %>% data.frame(CpG = .) %>% left_join(annotation, by = c("CpG"="Name"))
+N_Only <- setdiff(tt_out$Normal_Tissue$CpG, tt_out$Tumour_Tissue$CpG) %>% data.frame(CpG = .) %>% left_join(annotation, by = c("CpG"="Name"))
+TN_Int <- intersect(tt_out$Normal_Tissue$CpG, tt_out$Tumour_Tissue$CpG) %>% data.frame(CpG = .) %>% left_join(annotation, by = c("CpG"="Name"))
+
+write_tsv(T_Only, path = paste0("../Results/5HmC/2nd_go_TM_NoBB/Sets/",run_name,"_Tumour_Only_V2_with_negative.txt"))
+write_tsv(N_Only, path = paste0("../Results/5HmC/2nd_go_TM_NoBB/Sets/",run_name,"_Normal_Only_V2_with_negative.txt"))
+write_tsv(TN_Int, path = paste0("../Results/5HmC/2nd_go_TM_NoBB/Sets/",run_name,"_Tumour_Normal_Intersect_V2_with_negative.txt"))
+
+```
+
+
+
+
+```{r upset_barchart}
+
+df_upset        <- data.frame(CpG = "")
+vars_to_process <- names(cont)
+
+for(i in vars_to_process) {
+  tmpdf              <- data.frame(CpG = unique(tt_out[[i]]$CpG), DM = 1)
+  colnames(tmpdf)[2] <- i
+  df_upset           <- df_upset %>% full_join(tmpdf) 
+}
+df_upset[is.na(df_upset)] <- 0
+df_upset                  <- df_upset[-1,]
+
+df_upset_out              <- df_upset %>% left_join(annotation, by = c("CpG"="Name"))
+write_tsv(df_upset_out, path = paste0("../Results/5HmC/2nd_go_TM_NoBB/Upset_Barchart/",run_name,"_V2_with_negative_UpSet_Table.txt"))
+
+
+png(paste0("../Results/5HmC/2nd_go_TM_NoBB/Upset_Barchart/",run_name,"_V2_with_negative_UpSet_Plot.png"),
+      width  = 13,height = 7.5,
+      units  = "in",res    = 600)
+upset(df_upset, sets = vars_to_process); dev.off()
+
+
+
+
+df_bar <- c()
+for(i in names(tt_out)) {
+  tmp_df     <- df_upset %>% dplyr::select(ends_with(i))
+  tmp_sum    <- sum(tmp_df[[1]])
+  tmp_df_out <- data.frame(Tissue = i, 
+                           Class  = c("Sum"),
+                           Counts = c(tmp_sum))
+  df_bar     <- rbind(df_bar, tmp_df_out)
+}
+df_bar_in <- df_bar
+gg        <- ggplot(df_bar_in, aes(Tissue,Counts)) +
+             geom_bar(stat = "identity", position = "dodge") + 
+             theme_bw() + 
+             geom_text(aes(label=Counts), vjust=0, fontface = "bold") +
+             # theme(axis.text.x=element_text(angle = -90, hjust = 0)) +
+             theme(axis.text  = element_text(size = 12, face = "bold"),
+                   axis.title = element_text(size = 12),
+                   plot.title = element_text(size = 14, face = "bold")) + 
+             ggtitle("The Number of 5HmC Sites found in each Tissue Group")
+print(gg)
+png(paste0("../Results/5HmC/2nd_go_TM_NoBB/Upset_Barchart/",run_name,"_V2_with_negative_Barchart_Plot.png"),
+      width  = 13,height = 7.5,
+      units  = "in",res    = 600)
+print(gg); dev.off()
+
+beta_tmp <- df_upset %>% filter(Tumour_Tissue == 1) %>% 
+            left_join(tt_out$Tumour_Tissue)
+beta_tmp$Delta_Beta %>% mean
+beta_tmp$Delta_Beta %>% max
+beta_tmp$Delta_Beta %>% min
+
+beta_tmp <- df_upset %>% filter(Normal_Tissue == 1) %>% 
+            left_join(tt_out$Normal_Tissue)
+beta_tmp$Delta_Beta %>% mean
+beta_tmp$Delta_Beta %>% max
+beta_tmp$Delta_Beta %>% min
+```
+
+
+```{r add_betas}
+foo.normal <- read_tsv("../Results/5HmC/2nd_go_TM_NoBB/negative_value_Paired_Normal_Tissue_2nd_go_TM_NoBB.txt") 
+foo.tumour <- read_tsv("../Results/5HmC/2nd_go_TM_NoBB/negative_value_Paired_Tumour_Tissue_2nd_go_TM_NoBB.txt")
+
+for(i in list.files("../Results/5HmC/2nd_go_TM_NoBB/Sets/", pattern = "*BB_Normal_Only*", full.names = T)) {
+  file_name <- basename(i) %>% gsub(".txt","",.)
+  file_path <- "../Results/5HmC/2nd_go_TM_NoBB/Sets/Appended/"
+  
+  foo_temp  <- read_tsv(i) %>% 
+               dplyr::select(CpG) %>% 
+               left_join(foo.normal)
+  write_tsv(foo_temp, path = paste0(file_path,file_name,"_Appended.txt"))
+}
+
+for(i in list.files("../Results/5HmC/2nd_go_TM_NoBB/Sets/", pattern = "*BB_Tumour_Only*", full.names = T)) {
+  file_name <- basename(i) %>% gsub(".txt","",.)
+  file_path <- "../Results/5HmC/2nd_go_TM_NoBB/Sets/Appended/"
+  
+  foo_temp  <- read_tsv(i) %>% 
+               dplyr::select(CpG) %>% 
+               left_join(foo.tumour)
+  write_tsv(foo_temp, path = paste0(file_path,file_name,"_Appended.txt"))
+}
+
+for(i in list.files("../Results/5HmC/2nd_go_TM_NoBB/Sets/", pattern = "*Intersect*", full.names = T)) {
+  file_name <- basename(i) %>% gsub(".txt","",.)
+  file_path <- "../Results/5HmC/2nd_go_TM_NoBB/Sets/Appended/"
+  
+  foo_temp  <- read_tsv(i) %>% 
+               dplyr::select(CpG) %>% 
+               left_join({foo.tumour %>% dplyr::select(CpG, Delta_Beta_Tumour = Delta_Beta, adj.P.Val.Tumour = adj.P.Val)}) %>% 
+               left_join(foo.normal) %>% 
+               dplyr::select(CpG, Delta_Beta_Normal = Delta_Beta, adj.P.Val.Normal = adj.P.Val, everything())
+  write_tsv(foo_temp, path = paste0(file_path,file_name,"_Appended.txt"))
+}
+
+```
+
