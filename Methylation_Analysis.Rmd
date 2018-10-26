@@ -1,0 +1,390 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r load_library, message=FALSE}
+library(readr)
+library(minfi)
+library(dplyr)
+library(shinyMethyl)
+library(ggplot2)
+library(limma)
+library(DMRcate)
+library(reshape2)
+library(GenomicFeatures)
+library(biomaRt)
+library(biovizBase)
+library(ggbio)
+library(cowplot)
+# library(TCGAbiolinks)
+```
+
+```{r pheno_load}
+
+# experiment_in <- "1st_go_TM" #Other Option= 2nd_go_TM
+# experiment_in <- "2nd_go_TM" #Other Option= 
+experiment_in <- "2nd_go_TM_BBRemove"
+
+
+if(experiment_in == "1st_go_TM") {
+  pheno_filter <- "BT3010|BT3104|NHU86|NHU102|EJ|RT112"
+} else if(experiment_in == "2nd_go_TM") {
+  pheno_filter <- "Blood|Brain|NT|BC"
+} else if(experiment_in == "2nd_go_TM_BBRemove") {
+  pheno_filter <- "NT|BC"
+} else {
+  message("Invalid Argument")
+}
+
+pheno = read_tsv("Analysis_Final_Structure/Phenotype_Data/all.array1.txt") %>% as.data.frame %>%
+mutate(Basename = paste0("Analysis_Final_Structure/Data/raw_idat/",sentrixID),
+       grade = ifelse(grepl("hgg",grade),"hgrade",grade), 
+       tissue_type = ifelse(tissue_type == "ctissue", sample, tissue_type), 
+       Tiss_Conv2 = paste0(grade,"_",tissue_type, "_", conversion)) %>% 
+       filter(sample != "PC6") %>% 
+       mutate(sample = ifelse(grepl("PC",sample),gsub("PC","BC",sample), sample)) %>% 
+       filter(grepl(pheno_filter, sample))
+      
+        # sample      != "BT3010",
+        # sample      != "BT3104",
+        # sample      != "Blood",
+        # sample      != "Brain",
+        # sample      != "EJ",
+        # sample      != "RT112",
+        # tissue_type != "pline")
+       
+       
+# pheno$Tiss_Conv2 %>% table
+# write_tsv(pheno, path="pheno_file_in_allTM_noBC6.txt")
+pheno
+
+read_tsv("Analysis_Final_Structure/Phenotype_Data/all.array1.txt") %>% as.data.frame %>%
+    mutate(Basename = paste0("Analysis_Final_Structure/Data/raw_idat/",sentrixID),
+           grade = ifelse(grepl("hgg",grade),"hgrade",grade), 
+           tissue_type = ifelse(tissue_type == "ctissue", sample, tissue_type), 
+           Tiss_Conv2 = paste0(grade,"_",tissue_type, "_", conversion)) %>% 
+    filter(sample != "PC6") %>% 
+    mutate(sample = ifelse(grepl("PC",sample),gsub("PC","BC",sample), sample)) %>% .$Tiss_Conv2 %>% table()
+```
+
+
+```{r reading_idat}
+raw_data <- read.metharray.exp(targets = pheno)
+raw_data
+det_pval                    <- raw_data %>% detectionP(type = "m+u")
+det_pval_fail               <- det_pval > 0.01
+det_pval_remove             <- names(which(rowMeans(det_pval_fail) > 0.5, TRUE))
+```
+
+```{r QC}
+# summary <- shinySummarize(raw_data)
+# runShinyMethyl(summary)
+```
+
+```{r normalisation_data}
+set.seed(123)
+norm_data  <- minfi::preprocessFunnorm(raw_data)
+norm_data
+```
+
+```{r probe_filter}
+Mvals               <- norm_data %>% getM
+Bvals               <- norm_data %>% getBeta
+
+mutimappers         <- read_tsv("./Analysis_Final_Structure/Reference/HumanMethylation450_15017482_v.1.1_hg19_bowtie_multimap.txt", 
+                                col_types=cols(), col_names = F) %>% 
+                       .$X1 %>% unique
+crossreact          <- read_csv("./Analysis_Final_Structure/Reference/48639-non-specific-probes-Illumina450k.csv", 
+                                col_types=cols()) %>% 
+                       .$TargetID %>% unique
+cpg_remove_mmcr     <- c(mutimappers,crossreact) %>% unique
+
+remove              <- which(abs(Mvals)==Inf, arr.ind=TRUE)[,1]
+beta_thres          <- (Bvals > 0.8 | Bvals < 0.2) %>% 
+                       apply(., 1, all) %>% 
+                       .[. == T] %>% 
+                       names
+
+remove              <- c(remove,match(unique(c(det_pval_remove,beta_thres,cpg_remove_mmcr)),
+                                      rownames(norm_data))) %>% 
+                       unique %>% na.omit
+
+if(length(remove) > 0) {
+  norm_data_f       <- norm_data[-remove,]
+}else{
+  norm_data_f       <- norm_data
+}
+# norm_data_f         <- norm_data_f[-(match(det_pval_remove,
+#                                            rownames(norm_data_f)) %>% na.omit),]
+
+# manifest            <- raw_data %>% getManifest
+norm_data_f         <- norm_data_f %>% addSnpInfo
+# snps_filtered       <- norm_data_f@rowRanges %>% 
+#                        as.data.frame %>% add_rownames("CpG") %>% 
+#                        filter(Probe_maf > 0.05 | CpG_maf > 0.05 | SBE_maf > 0.05) %>% 
+#                        .$CpG %>% as.vector
+
+norm_data_f         <- norm_data_f %>% dropLociWithSnps(., snps = c("SBE","CpG","Probe"), maf  = 0.05)
+annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+# xy_filtered         <- annotation %>% add_rownames("CpG") %>%
+#                        filter(chr == "chrX" | chr == "chrY") %>%
+#                        .$CpG %>% as.vector
+
+norm_data_f         <- norm_data_f[-grep("chrX|chrY", annotation$chr),]
+annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+
+rm(Mvals,Bvals,det_pval,beta_thres); gc()
+# Mvals               <- norm_data_f %>% getM
+# Bvals               <- norm_data_f %>% getBeta
+norm_data_f
+```
+
+
+```{r save_preprocessing}
+pheno_in              <- pData(norm_data_f) %>% as.data.frame 
+design                <- model.matrix(~0 + Tiss_Conv2, data = pheno_in)
+block_in              <- pheno_in$sample
+colnames(design)      <- colnames(design) %>% gsub("Tiss_Conv2","",.)
+Corr                  <- duplicateCorrelation(getM(norm_data_f), design, block = block_in)
+
+# save(Corr, design, norm_data_f, pheno_in, annotation, file = paste0(experiment_in,"_Preprocessed.RData"), compress = T)
+```
+
+
+
+
+```{r pca_v1}
+pca                 <- norm_data_f %>% getM %>% t %>% prcomp
+d                   <- pca$x %>% as.data.frame %>% add_rownames("sentrixID") %>% 
+                       left_join((pData(norm_data_f) %>% as.data.frame)) %>% 
+                       mutate_each(funs(factor),Tiss_Conv2) %>% 
+                       as.data.frame
+pcv                 <- round((pca$sdev)^2 / sum(pca$sdev^2)*100, 2)
+
+gg                  <- ggplot(d, aes(PC1,PC2)) +
+                       geom_point(aes(colour = sample, shape=conversion, label=sample)) + 
+                       theme_bw() +
+                       ggtitle("PCA of Normalised Methylation Data") +
+                       theme(axis.title.x    = element_text(size=15),
+                             axis.title.y    = element_text(size=15)) +
+                       xlab(label = paste0("PC (", pcv[1], "%)")) +
+                       ylab(label = paste0("PC (", pcv[2], "%)")) + 
+                       geom_text(aes(label=sample), nudge_x=50)#+
+                       # geom_text(aes(label = Sample_Name))
+print(gg)
+  
+# png(paste0("../Analysis/Healthy_T_Cells/","PCA.png"),
+#       width  = 10.98,height = 10.98,
+#       units  = "in",res    = 600)
+# print(gg); dev.off()
+
+# Scree Plot
+# foo <- data.frame(PC_Variation = pcv, Number = 1:20)
+# ggplot(foo, aes(Number, PC_Variation)) + geom_point() + geom_line() + theme_bw() + ylab("% Variation Explained") + xlab("Principle Component")
+```
+
+```{r unsupervised_clustring_tissue_type}
+Mvals = getM(norm_data_f)
+colnames(Mvals) = pheno$sample
+clusters <- hclust(dist(t(Mvals)))
+plot(clusters)
+```
+
+```{r beta_dist}
+pheno_tmp <- pData(norm_data_f) %>% as.data.frame %>% 
+             mutate(Type = ifelse(grepl("normal",grade),"Normal", "Tumour"))
+df        <- norm_data %>% 
+             getBeta %>% 
+             melt(value.name = "beta") %>% 
+             left_join(pheno_tmp, by = c("Var2"="sentrixID")) %>% 
+             filter(grepl("normal_ntissue|hgrade_ttissue", Tiss_Conv2),
+                    sample != "BT3010")
+
+gg        <- ggplot(df, aes(beta, colour = sample, linetype = conversion)) +
+             geom_density() + theme_bw() +
+             scale_colour_brewer(palette = "Set1") +
+             # scale_color_manual(values=cbPalette)
+             facet_grid(. ~ Type)
+print(gg)
+```
+
+
+
+
+
+```{r 5HmC_DM}
+model_type            <- "Paired"
+pheno_in              <- pData(norm_data_f) %>% as.data.frame 
+design                <- model.matrix(~0 + Tiss_Conv2, data = pheno_in)
+block_in              <- pheno_in$sample
+colnames(design)      <- colnames(design) %>% gsub("Tiss_Conv2","",.)
+cont                  <- c("Tumour_Tissue"                  = "hgrade_ttissue_BS-hgrade_ttissue_OXBS",
+                           "Normal_Tissue"                  = "normal_ntissue_BS-normal_ntissue_OXBS")
+                           # "Whole_Blood"                    = "normal_Blood_BS-normal_Blood_OXBS",
+                           # "Brain_Tissue"                   = "normal_Brain_BS-normal_Brain_OXBS")
+cont_mat              <- makeContrasts(contrasts = cont, levels = colnames(design))
+colnames(cont_mat)    <- names(cont)
+cont_vec              <- cont %>% gsub("-","_Vs_",.)
+mVal                  <- getM(norm_data_f)
+bVal                  <- getBeta(norm_data_f)
+fitm                  <- lmFit(getM(norm_data_f),    design, block = block_in, correlation = Corr$cor) %>% 
+                         contrasts.fit(cont_mat) %>% eBayes
+fitb                  <- lmFit(getBeta(norm_data_f), design, block = block_in, correlation = Corr$cor) %>%
+                         contrasts.fit(cont_mat) %>% eBayes
+contrasts             <- colnames(cont_mat)
+pVal                  <- 0.01
+fc                    <- 0.1
+```
+
+
+
+
+
+```{r 5mC_DMP_Group}
+model_type            <- "Grouped"
+pheno_in              <- pData(norm_data_f) %>% as.data.frame
+design                <- model.matrix(~0 + Tiss_Conv2, data = pheno_in)
+colnames(design)      <- colnames(design) %>% gsub("Tiss_Conv2","",.)
+cont                  <- c("Tumour-Normal_BS"               = "hgrade_ttissue_BS-normal_ntissue_BS",
+                           "Tumour-Normal_OXBS"             = "hgrade_ttissue_OXBS-normal_ntissue_OXBS")
+cont_mat              <- makeContrasts(contrasts = cont, levels = colnames(design))
+colnames(cont_mat)    <- names(cont)
+cont_vec              <- cont %>% gsub("-","_Vs_",.)
+fitm                  <- lmFit(getM(norm_data_f),    design) %>%
+                         contrasts.fit(cont_mat) %>% eBayes
+fitb                  <- lmFit(getBeta(norm_data_f), design) %>%
+                         contrasts.fit(cont_mat) %>% eBayes
+contrasts             <- colnames(cont_mat)
+pVal                  <- 0.01
+fc                    <- 0.1
+```
+
+
+
+```{r Results, cache=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+tt_out  <- list()
+ttu_out <- list()
+for(i in names(cont_vec)) {
+  ttm                  <- topTable(fitm, coef = i, number = Inf, p.value = pVal, adjust.method = "BH") %>% 
+                          as.data.frame %>% add_rownames("CpG")
+  ttum                 <- topTable(fitm, coef = i, number = Inf, adjust.method = "BH") %>% 
+                          as.data.frame %>% add_rownames("CpG")
+  if(nrow(ttm) > 0) {
+    ttm                  <- ttm %>% dplyr::select(CpG,`adj.P.Val`)
+    ttb                  <- topTable(fitb, coef = i, number = Inf) %>% 
+                            as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,Delta_Beta = logFC)
+    tt                   <- ttm %>% left_join(ttb)  %>% 
+                                    left_join(annotation, by = c("CpG" = "Name")) %>% 
+                                    filter(abs(Delta_Beta) > fc) %>% arrange(desc(abs(Delta_Beta)))
+    
+    ttum                 <- ttum %>% dplyr::select(CpG,`adj.P.Val`)
+    ttub                 <- topTable(fitb, coef = i, number = Inf) %>% 
+                            as.data.frame %>% add_rownames("CpG") %>% dplyr::select(CpG,Delta_Beta = logFC)
+    ttu                  <- ttum %>% left_join(ttub)  %>% 
+                                     left_join(annotation, by = c("CpG" = "Name"))
+    
+    tt %>% print
+    tt_out[[i]]          <- tt
+    ttu_out[[i]]         <- ttu
+    # write_tsv(tt, path = paste0("Results_Final/5HmC_DMP/BS_-_OXBS_DMP_",model_type,"_",i,"_",run_name,".txt"))
+    # write_tsv(tt, path = paste0("Results_Final/5HmC_DMP/DMP_",model_type,"_",i,"_",run_name,".txt"))
+  } else {
+    paste0(i, ": No DM Results") %>% print
+  }
+}
+```
+
+```{r DMR_Detection}
+# design_DMR                <- model.matrix(~sample + Tiss_Conv, data = pheno_in)
+# colnames(design_DMR)      <- colnames(design_DMR) %>% gsub("Tiss_Conv","",.)
+
+DMR_List_Out <- list()
+for(i in colnames(cont_mat)) {
+  myannotation       <- cpg.annotate(datatype      = "array",
+                                     what          = "M",
+                                     arraytype     = "450K",
+                                     object        = mVal, 
+                                     analysis.type = "differential", 
+                                     design        = design, 
+                                     coef          = i,
+                                     contrasts     = T, 
+                                     cont.matrix   = cont_mat,
+                                     fdr           = 0.01)
+  # For Paired DMR Modelling 
+    # source("Cpg_Annotate2.R")
+    # myannotation       <- cpg.annotate2(datatype      = "array",
+    #                                  what          = "M",
+    #                                  arraytype     = "450K",
+    #                                  object        = mVal, 
+    #                                  analysis.type = "differential", 
+    #                                  design        = design, 
+    #                                  coef          = i,
+    #                                  contrasts     = T, 
+    #                                  cont.matrix   = cont_mat,
+    #                                  corr_coef     = Corr$cor,
+    #                                  blocking_factor = block_in,
+    #                                  fdr           = 0.01)
+  
+  dmrcoutput         <- dmrcate(myannotation) 
+                      
+  dmrresults         <- dmrcoutput$results %>% 
+                        as.data.frame %>% 
+                        mutate(betaAfc = abs(meanbetafc)) %>% 
+                        filter(betaAfc > 0.1) %>% 
+                        arrange(desc(no.cpgs))
+  
+  dmr_genes_tmp <- sapply(dmrresults$coord, function(x) {
+    dmr_coords           <- x
+    dmr_chr              <- strsplit(dmr_coords, ':')[[1]][1]
+    dmr_start            <- as.numeric(strsplit(dmr_coords, '-|:')[[1]][2])
+    dmr_end              <- as.numeric(strsplit(dmr_coords, '-')[[1]][2])
+    dmr_anno             <- annotation %>% 
+                            filter(chr == dmr_chr,
+                                   pos >= (dmr_start),
+                                   pos <= (dmr_end))
+    dmr_genes            <- dmr_anno$UCSC_RefGene_Name %>% unique %>% .[. != ""]
+    dmr_enhancer         <- dmr_anno$Enhancer %>% unique %>% .[. != ""]
+    if(length(dmr_genes) == 0 & length(dmr_enhancer) == 0) {
+      return(c("",""))
+    } else {
+      dmr_genes_tmp        <- sapply(dmr_genes, function(y) {
+        gene_split_tmp       <- strsplit(y,";")[[1]] %>% unique
+        return(gene_split_tmp)
+      })
+      dmr_enhancers_tmp    <- sapply(dmr_enhancer, function(y) {
+        enhancer_split_tmp   <- strsplit(y,";")[[1]] %>% unique
+        return(enhancer_split_tmp)
+      })
+      
+      dmr_genes            <- dmr_genes_tmp %>% unlist %>% unique %>% paste(., collapse = ";")
+      dmr_enhancers        <- dmr_enhancers_tmp %>% unlist %>% unique %>% paste(., collapse = ";")
+      return(c(dmr_genes,dmr_enhancers))
+      # return(dmr_genes)
+    }
+  })
+  gene_enhancer_tmp <- dmr_genes_tmp %>% unlist
+  
+  
+  dmrresults$Genes      <- gene_enhancer_tmp[seq(1,length(gene_enhancer_tmp),2)]
+  dmrresults$Enhancers  <- gene_enhancer_tmp[seq(2,length(gene_enhancer_tmp),2)]
+  DMR_List_Out[[i]]     <- dmrresults
+  
+  write_csv(dmrresults, path = paste0("Results_Final/5HmC_DMR/5HmC_DMR_",i,"_",run_name,"_",model_type,".csv"))
+  print(dmrresults)
+}
+
+# DMR_List_Out[[1]] %>% .$meanbetafc %>% .[. > 0] %>% length
+# DMR_List_Out[[1]] %>% .$meanbetafc %>% .[. < 0] %>% length
+# DMR_List_Out[[2]] %>% .$meanbetafc %>% .[. > 0] %>% length
+# DMR_List_Out[[2]] %>% .$meanbetafc %>% .[. < 0] %>% length
+
+# Split this script into two.
+#   - One for 5HmC
+#   - One for Tumour Normal Analysis
+# Make two difference output directories
+# Parse DMR regions, get CpG names back for each region, then perform upset plot. - Done 
+# Redo the DMR to gene expression relationships
+```
+
+
